@@ -1,0 +1,84 @@
+{
+    "app_name": "Tri-Sharira Map Editor",
+    "version": "1.0.0",
+    "theme_mode": "dark",
+    "color_theme": "blue",
+    "default_map_width": 40,
+    "default_map_height": 30,
+    "default_tile": "G",
+    "file_delimiter": "|",
+    "grid_color": "#666666",
+    "show_grid": true,
+    "window_width": 1920,
+    "window_height": 989,
+    "canvas_zoom_factor": 1.0,
+    "show_minimap": true,
+    "minimap_size": 200,
+    "autosave_interval": 5,
+    "max_undo_steps": 50,
+    "show_tooltips": true,
+    "default_save_dir": "./data",
+    "export_dir": "./exports",
+    "recent_files_max": 10,
+    "recent_files": [],
+    "terrain_categories": {
+        "Basis terrein": {
+            "G": "Gras",
+            "W": "Water",
+            "P": "Pad",
+            "Br": "Brug",
+            "Be": "Berg"
+        },
+        "Gebouwen": {
+            "H": "Huis",
+            "Te": "Tempel/Ashram"
+        },
+        "Vegetatie": {
+            "Tr": "Boom"
+        },
+        "NPC's": {
+            "NE": "Dorpsoudste",
+            "NH": "Handelaar",
+            "NJ": "Jongere",
+            "NS": "Spirituele meester",
+            "V": "Handelaar (oude aanduiding)"
+        },
+        "Overig": {
+            " ": "Leeg"
+        }
+    },
+    "terrain_colors": {
+        "G": "#90EE90",
+        "W": "#ADD8E6",
+        "P": "#DEB887",
+        "Tr": "#228B22",
+        "H": "#CD853F",
+        "Te": "#FFD700",
+        "Br": "#8B4513",
+        "Be": "#A0522D",
+        "NE": "#4169E1",
+        "NH": "#FFD700",
+        "NJ": "#32CD32",
+        "NS": "#9932CC",
+        "V": "#FFD700",
+        " ": "#FFFFFF"
+    },
+    "default_layers": [
+        {
+            "name": "Terrein",
+            "visible": true,
+            "locked": false
+        },
+        {
+            "name": "Objecten",
+            "visible": true,
+            "locked": false
+        },
+        {
+            "name": "NPC's",
+            "visible": true,
+            "locked": false
+        }
+    ],
+    "active_layer": 0
+}
