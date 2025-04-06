@@ -1,3 +1,6 @@
+from .layer_base import BaseLayer
+import copy # Nodig voor de resize methode
+
 class TileLayer(BaseLayer):
     """Een laag die een grid van tiles bevat."""
     def __init__(self, name, width, height, id, default_value=0, **kwargs): # default_value is tile ID 0

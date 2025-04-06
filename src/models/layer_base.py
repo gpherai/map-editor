@@ -1,5 +1,3 @@
-from .layer_base import BaseLayer
-
 # --- Layer Classes ---
 class BaseLayer:
     """Basisklasse voor alle kaartlagen."""
