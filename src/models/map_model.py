@@ -1,884 +1,613 @@
 # src/models/map_model.py
 # Model voor de Map Editor - beheert de kaartdata en operaties
+# Versie aangepast voor JSON formaat met metadata en typed layers.
 
 import os
 import json
 from collections import deque
 import time
+import copy # Nodig voor deep copies in undo/redo
 
+# Importeer de gesplitste klassen
+from .map_object import MapObject
+from .layer_tile import TileLayer  # Impliciet BaseLayer via overerving
+from .layer_objectgroup import ObjectGroupLayer # Impliciet BaseLayer via overerving
+from .map_action import MapAction
+from .layer_base import BaseLayer
 
-class MapAction:
-    """Klasse voor het bijhouden van acties voor undo/redo-functionaliteit."""
-
-    def __init__(self, action_type, data):
-        """
-        Initialiseert een nieuwe actie.
-
-        Args:
-            action_type (str): Type actie ('set_cell', 'resize', 'fill', etc.)
-            data (dict): Data specifiek voor het actietype
-        """
-        self.type = action_type
-        self.data = data
-        self.timestamp = time.time()
-
-
-class Layer:
-    """Een enkele laag in de kaart, bevat data voor één type element (terrein, objecten, etc.)."""
-
-    def __init__(
-        self, name, width, height, default_value=" ", visible=True, locked=False
-    ):
-        """
-        Initialiseert een nieuwe laag.
-
-        Args:
-            name (str): Naam van de laag
-            width (int): Breedte van de laag in cellen
-            height (int): Hoogte van de laag in cellen
-            default_value (str): Standaardwaarde voor nieuwe cellen
-            visible (bool): Of de laag zichtbaar is
-            locked (bool): Of de laag vergrendeld is (niet bewerkbaar)
-        """
-        self.name = name
-        self.width = width
-        self.height = height
-        self.visible = visible
-        self.locked = locked
-        self.data = [[default_value for _ in range(width)] for _ in range(height)]
-
-    def set_cell(self, row, col, value):
-        """
-        Stelt de waarde van een cel in.
-
-        Args:
-            row (int): Rij-index
-            col (int): Kolom-index
-            value (str): Nieuwe waarde
-
-        Returns:
-            str: Oude waarde van de cel
-        """
-        if 0 <= row < self.height and 0 <= col < self.width:
-            old_value = self.data[row][col]
-            self.data[row][col] = value
-            return old_value
-        return None
-
-    def get_cell(self, row, col):
-        """
-        Haalt de waarde van een cel op.
-
-        Args:
-            row (int): Rij-index
-            col (int): Kolom-index
-
-        Returns:
-            str: Waarde van de cel of None als buiten bereik
-        """
-        if 0 <= row < self.height and 0 <= col < self.width:
-            return self.data[row][col]
-        return None
-
-    def resize(self, new_width, new_height, default_value=" "):
-        """
-        Past de grootte van de laag aan.
-
-        Args:
-            new_width (int): Nieuwe breedte
-            new_height (int): Nieuwe hoogte
-            default_value (str): Waarde voor nieuwe cellen
-
-        Returns:
-            tuple: Oude afmetingen (width, height)
-        """
-        old_width, old_height = self.width, self.height
-
-        # Maak nieuwe data array
-        new_data = [
-            [default_value for _ in range(new_width)] for _ in range(new_height)
-        ]
-
-        # Kopieer bestaande data waar mogelijk
-        for row in range(min(self.height, new_height)):
-            for col in range(min(self.width, new_width)):
-                new_data[row][col] = self.data[row][col]
-
-        # Update layer properties
-        self.width = new_width
-        self.height = new_height
-        self.data = new_data
-
-        return (old_width, old_height)
-
-    def fill(self, value, start_row=None, start_col=None, end_row=None, end_col=None):
-        """
-        Vult een gebied van de laag met een waarde.
-
-        Args:
-            value (str): Waarde om in te vullen
-            start_row (int, optional): Begin-rij, standaard hele laag
-            start_col (int, optional): Begin-kolom, standaard hele laag
-            end_row (int, optional): Eind-rij, standaard hele laag
-            end_col (int, optional): Eind-kolom, standaard hele laag
-
-        Returns:
-            list: Lijst van (row, col, oude_waarde) tuples die gewijzigd zijn
-        """
-        # Standaard hele laag als gebied niet gespecificeerd is
-        if start_row is None:
-            start_row = 0
-        if start_col is None:
-            start_col = 0
-        if end_row is None:
-            end_row = self.height - 1
-        if end_col is None:
-            end_col = self.width - 1
-
-        # Begrens binnen laagafmetingen
-        start_row = max(0, min(start_row, self.height - 1))
-        start_col = max(0, min(start_col, self.width - 1))
-        end_row = max(0, min(end_row, self.height - 1))
-        end_col = max(0, min(end_col, self.width - 1))
-
-        # Houd gewijzigde cellen bij
-        changed_cells = []
-
-        # Vul het gebied
-        for row in range(start_row, end_row + 1):
-            for col in range(start_col, end_col + 1):
-                old_value = self.data[row][col]
-                if old_value != value:  # Alleen bijhouden als het echt verandert
-                    self.data[row][col] = value
-                    changed_cells.append((row, col, old_value))
-
-        return changed_cells
-
-    def to_dict(self):
-        """Converteert laag naar een dictionary voor serialisatie."""
-        return {
-            "name": self.name,
-            "width": self.width,
-            "height": self.height,
-            "visible": self.visible,
-            "locked": self.locked,
-            "data": self.data,
-        }
-
-    @classmethod
-    def from_dict(cls, data_dict):
-        """
-        Maakt een Layer-instantie van een dictionary.
-
-        Args:
-            data_dict (dict): Dictionary met laagdata
-
-        Returns:
-            Layer: Nieuwe Layer-instantie
-        """
-        layer = cls(
-            name=data_dict["name"],
-            width=data_dict["width"],
-            height=data_dict["height"],
-            visible=data_dict.get("visible", True),
-            locked=data_dict.get("locked", False),
-        )
-        layer.data = data_dict["data"]
-        return layer
-
-
+# --- MapModel Class ---
 class MapModel:
     """Model voor de kaartdata, ondersteunt meerdere lagen en undo/redo."""
 
     def __init__(self, config):
         """
         Initialiseert het kaartmodel.
-
         Args:
-            config: Config-instantie met instellingen
+            config: Dict-like object met configuratie-instellingen.
         """
         self.config = config
+        self.new_map() # Start met een lege kaart volgens config
 
-        # Basisattributen
-        self.width = config.get("default_map_width", 40)
-        self.height = config.get("default_map_height", 30)
+    def new_map(self, width=None, height=None):
+        """Maakt een nieuwe, lege kaart aan."""
+        old_state_dict = self.to_dict() if hasattr(self, 'metadata') and self.metadata else None # Voor undo
+
+        map_w = width if width is not None else self.config.get("default_map_width", 40)
+        map_h = height if height is not None else self.config.get("default_map_height", 30)
+        tile_w = self.config.get("tile_width", 32)
+        tile_h = self.config.get("tile_height", 32)
+
+        # Reset object ID counter
+        MapObject._next_id = 1
+
+        self.metadata = {
+            "mapName": "Nieuwe Kaart", # Zal overschreven worden bij save/load
+            "mapWidth": map_w,
+            "mapHeight": map_h,
+            "tileWidth": tile_w,
+            "tileHeight": tile_h,
+            "bgMusic": "",
+            "infinite": False,
+            "nextlayerid": 1, # Start laag ID's vanaf 1
+            "nextobjectid": 1, # Start object ID's vanaf 1 (wordt beheerd door MapObject class)
+            "orientation": "orthogonal",
+            "renderorder": "right-down",
+            "tiledversion": "1.10.0", # Indicatie van recent Tiled formaat
+            "tilesets": [], # Leeg voor nu
+            "type": "map",
+            "version": "1.10" # Tiled JSON formaat versie
+        }
+        self.width = map_w
+        self.height = map_h
         self.current_file = None
         self.unsaved_changes = False
         self.active_layer_index = 0
+        self.layers = [] # Lijst van Layer objecten
 
-        # Lagen initaliseren
-        self.layers = []
-        default_layers = config.get("default_layers", [])
+        # Maak standaard lagen aan
+        default_layers_config = self.config.get("default_layers", [
+            {"name": "Terrain", "type": "tilelayer", "visible": True, "locked": False},
+            {"name": "Objects", "type": "objectgroup", "visible": True, "locked": False},
+            {"name": "NPCs",    "type": "objectgroup", "visible": True, "locked": False}
+        ])
+        layer_id_counter = 1
+        for layer_config in default_layers_config:
+            layer_type = layer_config.get("type", "tilelayer")
+            layer_name = layer_config.get("name", f"Laag {layer_id_counter}")
+            layer_visible = layer_config.get("visible", True)
+            layer_locked = layer_config.get("locked", False)
+            layer = None
 
-        if default_layers:
-            # Maak lagen uit configuratie
-            for layer_config in default_layers:
-                self.layers.append(
-                    Layer(
-                        name=layer_config["name"],
-                        width=self.width,
-                        height=self.height,
-                        default_value=(
-                            config.get("default_tile", "G")
-                            if layer_config["name"] == "Terrein"
-                            else " "
-                        ),
-                        visible=layer_config.get("visible", True),
-                        locked=layer_config.get("locked", False),
-                    )
-                )
-        else:
-            # Standaard laag als er geen in de configuratie staan
-            self.layers.append(
-                Layer(
-                    name="Terrein",
-                    width=self.width,
-                    height=self.height,
-                    default_value=config.get("default_tile", "G"),
-                )
-            )
+            if layer_type == "tilelayer":
+                layer = TileLayer(name=layer_name, width=self.width, height=self.height, id=layer_id_counter,
+                                  default_value=0, visible=layer_visible, locked=layer_locked)
+            elif layer_type == "objectgroup":
+                layer = ObjectGroupLayer(name=layer_name, width=self.width, height=self.height, id=layer_id_counter,
+                                       visible=layer_visible, locked=layer_locked)
 
-        # Undo/redo stacks
-        self.undo_stack = deque(maxlen=config.get("max_undo_steps", 50))
-        self.redo_stack = deque(maxlen=config.get("max_undo_steps", 50))
+            if layer:
+                 self.layers.append(layer)
+                 layer_id_counter += 1
+
+        self.metadata["nextlayerid"] = layer_id_counter
+
+        # Reset undo/redo stacks
+        self.undo_stack = deque(maxlen=self.config.get("max_undo_steps", 50))
+        self.redo_stack = deque(maxlen=self.config.get("max_undo_steps", 50))
+
+        # Voeg undo actie toe als er een vorige staat was
+        if old_state_dict:
+            self._add_action("new_map", {"old_state": old_state_dict, "new_state": self.to_dict()}) # Sla ook nieuwe staat op
+
+        self.unsaved_changes = False # Een nieuwe kaart heeft geen wijzigingen
+        return True
 
     @property
     def active_layer(self):
-        """Geeft de actieve laag."""
+        """Geeft de actieve laag (TileLayer of ObjectGroupLayer object)."""
         if 0 <= self.active_layer_index < len(self.layers):
             return self.layers[self.active_layer_index]
         return None
 
     def set_active_layer(self, index):
-        """
-        Stelt de actieve laag in.
-
-        Args:
-            index (int): Index van de laag
-
-        Returns:
-            bool: True als succesvol, False als index niet geldig is
-        """
+        """Stelt de actieve laag in op basis van index."""
         if 0 <= index < len(self.layers):
-            self.active_layer_index = index
-            return True
+            if self.active_layer_index != index:
+                 # Geen undo nodig voor enkel wisselen van actieve laag
+                self.active_layer_index = index
+                return True # Geeft aan dat de index gewijzigd is
         return False
 
-    def add_layer(self, name, default_value=" ", visible=True, locked=False):
-        """
-        Voegt een nieuwe laag toe.
+    def add_layer(self, name, layer_type="tilelayer", visible=True, locked=False):
+        """Voegt een nieuwe laag van een specifiek type toe."""
+        new_layer = None
+        layer_id = self.metadata.get("nextlayerid", len(self.layers) + 1)
 
-        Args:
-            name (str): Naam van de laag
-            default_value (str): Standaardwaarde voor cellen
-            visible (bool): Of de laag zichtbaar is
-            locked (bool): Of de laag vergrendeld is
-
-        Returns:
-            int: Index van de nieuwe laag
-        """
-        new_layer = Layer(
-            name=name,
-            width=self.width,
-            height=self.height,
-            default_value=default_value,
-            visible=visible,
-            locked=locked,
-        )
+        if layer_type == "tilelayer":
+            new_layer = TileLayer(
+                name=name, width=self.width, height=self.height, id=layer_id, default_value=0,
+                visible=visible, locked=locked
+            )
+        elif layer_type == "objectgroup":
+             new_layer = ObjectGroupLayer(
+                name=name, width=self.width, height=self.height, id=layer_id,
+                visible=visible, locked=locked
+            )
+        else:
+            print(f"Fout: Onbekend laag type '{layer_type}' kan niet worden toegevoegd.")
+            return -1
 
         self.layers.append(new_layer)
+        self.metadata["nextlayerid"] = layer_id + 1 # Update next layer ID in metadata
         new_index = len(self.layers) - 1
 
-        # Registreer actie voor undo
-        self._add_action("add_layer", {"layer_index": new_index})
-
-        self.unsaved_changes = True
-
+        self._add_action("add_layer", {
+            "layer_index": new_index,
+            "layer_data": new_layer.to_dict() # Sla volledige data op voor herstel
+        })
+        # self.unsaved_changes = True # Wordt gedaan door _add_action
         return new_index
 
     def remove_layer(self, index):
-        """
-        Verwijdert een laag.
+        """Verwijdert een laag op basis van index."""
+        if 0 <= index < len(self.layers) and len(self.layers) > 1: # Moet minimaal 1 laag overblijven
+            layer_to_remove = self.layers[index]
+            self._add_action("remove_layer", {
+                "layer_index": index,
+                "layer_data": layer_to_remove.to_dict() # Sla data van verwijderde laag op
+            })
+            self.layers.pop(index)
 
-        Args:
-            index (int): Index van de laag om te verwijderen
-
-        Returns:
-            Layer: De verwijderde laag, of None als de index niet geldig was
-        """
-        if (
-            0 <= index < len(self.layers) and len(self.layers) > 1
-        ):  # Laat minimaal 1 laag over
-            # Registreer actie voor undo
-            self._add_action(
-                "remove_layer",
-                {"layer_index": index, "layer_data": self.layers[index].to_dict()},
-            )
-
-            removed_layer = self.layers.pop(index)
-
-            # Update active_layer_index indien nodig
+            # Pas actieve index aan indien nodig
             if self.active_layer_index >= len(self.layers):
                 self.active_layer_index = len(self.layers) - 1
+            elif self.active_layer_index > index:
+                 self.active_layer_index -= 1
 
-            self.unsaved_changes = True
-            return removed_layer
-
+            # self.unsaved_changes = True # Wordt gedaan door _add_action
+            return layer_to_remove
         return None
 
-    def move_layer(self, delta):
-        """
-        Verplaatst de actieve laag omhoog of omlaag in de lagenstapel.
+    def move_layer(self, index, delta):
+        """Verplaatst de laag op 'index' omhoog (delta=-1) of omlaag (delta=1)."""
+        if not (0 <= index < len(self.layers)): return False
+        new_index = index + delta
+        if not (0 <= new_index < len(self.layers)): return False
 
-        Args:
-            delta (int): Verplaatsingsrichting, -1 voor omhoog, 1 voor omlaag
-
-        Returns:
-            bool: True als de verplaatsing succesvol was, anders False
-        """
-        # Check of er een actieve laag is
-        if self.active_layer_index is None:
-            return False
-            
-        # Bereken nieuwe index
-        new_index = self.active_layer_index + delta
-        
-        # Valideer nieuwe index
-        if not (0 <= new_index < len(self.layers)):
-            return False  # Buiten bereik, kan niet verplaatsen
-        
-        # Sla oude staat op voor undo
-        self._add_action(
-            "move_layer",
-            {
-                "old_index": self.active_layer_index,
-                "new_index": new_index
-            }
-        )
-        
-        # Verplaats laag in de lijst
-        layer = self.layers.pop(self.active_layer_index)
+        self._add_action("move_layer", {"old_index": index, "new_index": new_index})
+        layer = self.layers.pop(index)
         self.layers.insert(new_index, layer)
-        
-        # Update actieve laag index
-        self.active_layer_index = new_index
-        
-        # Geef wijziging aan
-        self.unsaved_changes = True
-        
+
+        # Update actieve index als deze beïnvloed is
+        if self.active_layer_index == index: self.active_layer_index = new_index
+        elif min(index, new_index) <= self.active_layer_index <= max(index, new_index):
+             self.active_layer_index += delta * -1 # Tegenovergestelde richting van laagbeweging
+
+        # self.unsaved_changes = True # Wordt gedaan door _add_action
         return True
 
     def set_cell(self, row, col, value, layer_index=None):
-        """
-        Stelt de waarde van een cel in.
-
-        Args:
-            row (int): Rij-index
-            col (int): Kolom-index
-            value (str): Nieuwe waarde
-            layer_index (int, optional): Index van de laag, standaard actieve laag
-
-        Returns:
-            tuple: (succes, oude_waarde)
-        """
-        layer = (
-            self.active_layer
-            if layer_index is None
-            else (
-                self.layers[layer_index]
-                if 0 <= layer_index < len(self.layers)
-                else None
-            )
-        )
-
-        if layer and not layer.locked:
-            old_value = layer.get_cell(row, col)
-
-            if old_value is not None and old_value != value:
-                layer.set_cell(row, col, value)
-
-                # Registreer actie voor undo
-                self._add_action(
-                    "set_cell",
-                    {
-                        "row": row,
-                        "col": col,
-                        "old_value": old_value,
-                        "new_value": value,
-                        "layer_index": (
-                            layer_index
-                            if layer_index is not None
-                            else self.active_layer_index
-                        ),
-                    },
-                )
-
-                self.unsaved_changes = True
-                return (True, old_value)
-
-        return (False, None)
+        """Stelt de waarde van een cel in op een TileLayer."""
+        layer_idx = layer_index if layer_index is not None else self.active_layer_index
+        if 0 <= layer_idx < len(self.layers):
+            layer = self.layers[layer_idx]
+            if isinstance(layer, TileLayer) and not layer.locked:
+                 try:
+                     int_value = int(value)
+                     old_value = layer.get_cell(row, col)
+                     if old_value is not None and old_value != int_value:
+                         if layer.set_cell(row, col, int_value) is not None: # Check return van set_cell
+                             self._add_action("set_cell", {
+                                 "layer_index": layer_idx, "row": row, "col": col,
+                                 "old_value": old_value, "new_value": int_value
+                             })
+                             return True
+                 except (ValueError, TypeError):
+                     print(f"Waarschuwing: Ongeldige waarde '{value}' voor set_cell.")
+        return False
 
     def get_cell(self, row, col, layer_index=None):
-        """
-        Haalt de waarde van een cel op.
-
-        Args:
-            row (int): Rij-index
-            col (int): Kolom-index
-            layer_index (int, optional): Index van de laag, standaard actieve laag
-
-        Returns:
-            str: Waarde van de cel of None als buiten bereik
-        """
-        layer = (
-            self.active_layer
-            if layer_index is None
-            else (
-                self.layers[layer_index]
-                if 0 <= layer_index < len(self.layers)
-                else None
-            )
-        )
-
-        if layer:
-            return layer.get_cell(row, col)
-
+        """Haalt de waarde van een cel op van een TileLayer."""
+        layer_idx = layer_index if layer_index is not None else self.active_layer_index
+        if 0 <= layer_idx < len(self.layers):
+            layer = self.layers[layer_idx]
+            if isinstance(layer, TileLayer):
+                return layer.get_cell(row, col)
         return None
 
     def get_cell_at_all_layers(self, row, col):
-        """
-        Haalt waarden op van een cel in alle zichtbare lagen.
-
-        Args:
-            row (int): Rij-index
-            col (int): Kolom-index
-
-        Returns:
-            list: Lijst van (laag_index, waarde) tuples
-        """
+        """Haalt waarden op van een cel in alle zichtbare TileLayers."""
         result = []
-
         for i, layer in enumerate(self.layers):
-            if layer.visible:
+            if layer.visible and isinstance(layer, TileLayer):
                 value = layer.get_cell(row, col)
-                if value and value != " ":  # Skip lege cellen
+                if value is not None and value != layer.default_value:
                     result.append((i, value))
-
         return result
 
     def get_top_cell(self, row, col):
-        """
-        Haalt de bovenste niet-lege waarde op van alle zichtbare lagen.
-
-        Args:
-            row (int): Rij-index
-            col (int): Kolom-index
-
-        Returns:
-            tuple: (laag_index, waarde) of (None, None) als alles leeg is
-        """
-        # Loop van boven naar beneden door de lagen
+        """Haalt de bovenste niet-default waarde op van alle zichtbare TileLayers."""
         for i in range(len(self.layers) - 1, -1, -1):
             layer = self.layers[i]
-            if layer.visible:
+            if layer.visible and isinstance(layer, TileLayer):
                 value = layer.get_cell(row, col)
-                if value and value != " ":  # Skip lege cellen
+                if value is not None and value != layer.default_value:
                     return (i, value)
-
         return (None, None)
 
     def resize(self, new_width, new_height):
-        """
-        Past de grootte van alle lagen aan.
+        """Past de grootte van de map en alle lagen aan."""
+        if new_width <= 0 or new_height <= 0:
+             print("Fout: Kaartafmetingen moeten positief zijn.")
+             return False
 
-        Args:
-            new_width (int): Nieuwe breedte
-            new_height (int): Nieuwe hoogte
+        old_metadata = copy.deepcopy(self.metadata)
+        old_layers_struct = [{"index": i, "data": layer.to_dict()} for i, layer in enumerate(self.layers)] # Sla structuur en data op
 
-        Returns:
-            tuple: (oude_breedte, oude_hoogte)
-        """
-        old_width, old_height = self.width, self.height
-
-        # Bewaar data voor undo
-        old_layers_data = []
-        for layer in self.layers:
-            old_layers_data.append(
-                {"index": self.layers.index(layer), "data": layer.to_dict()}
-            )
-
-        # Registreer actie voor undo
-        self._add_action(
-            "resize",
-            {
-                "old_width": old_width,
-                "old_height": old_height,
-                "new_width": new_width,
-                "new_height": new_height,
-                "old_layers_data": old_layers_data,
-            },
-        )
-
-        # Update alle lagen
-        for layer in self.layers:
-            layer.resize(new_width, new_height, " ")
-
+        self.metadata["mapWidth"] = new_width
+        self.metadata["mapHeight"] = new_height
         self.width = new_width
         self.height = new_height
-        self.unsaved_changes = True
 
-        return (old_width, old_height)
+        resized_layers_data = [] # Om nieuwe staat voor redo op te slaan
+        for i, layer in enumerate(self.layers):
+             if isinstance(layer, TileLayer):
+                 # TileLayer.resize past self.width/height en data aan
+                 layer.resize(new_width, new_height, default_value=layer.default_value)
+             # Object layers hoeven intern niet geresized te worden, alleen contextuele w/h
+             layer.width = new_width
+             layer.height = new_height
+             resized_layers_data.append(layer.to_dict()) # Sla nieuwe staat op
 
-    def fill(
-        self,
-        value,
-        layer_index=None,
-        start_row=None,
-        start_col=None,
-        end_row=None,
-        end_col=None,
-    ):
-        """
-        Vult een gebied van de kaart met een waarde.
-
-        Args:
-            value (str): Waarde om in te vullen
-            layer_index (int, optional): Index van de laag, standaard actieve laag
-            start_row (int, optional): Begin-rij, standaard hele laag
-            start_col (int, optional): Begin-kolom, standaard hele laag
-            end_row (int, optional): Eind-rij, standaard hele laag
-            end_col (int, optional): Eind-kolom, standaard hele laag
-
-        Returns:
-            bool: True als succesvol
-        """
-        layer = (
-            self.active_layer
-            if layer_index is None
-            else (
-                self.layers[layer_index]
-                if 0 <= layer_index < len(self.layers)
-                else None
-            )
-        )
-
-        if layer and not layer.locked:
-            # Vul het gebied en ontvang gewijzigde cellen
-            changed_cells = layer.fill(value, start_row, start_col, end_row, end_col)
-
-            if changed_cells:
-                # Registreer actie voor undo
-                self._add_action(
-                    "fill",
-                    {
-                        "layer_index": (
-                            layer_index
-                            if layer_index is not None
-                            else self.active_layer_index
-                        ),
-                        "changed_cells": changed_cells,
-                    },
-                )
-
-                self.unsaved_changes = True
-                return True
-
-        return False
-
-    def toggle_layer_visibility(self, index):
-        """
-        Schakelt de zichtbaarheid van een laag.
-
-        Args:
-            index (int): Index van de laag
-
-        Returns:
-            bool: Nieuwe zichtbaarheidsstatus
-        """
-        if 0 <= index < len(self.layers):
-            layer = self.layers[index]
-            old_visible = layer.visible
-            layer.visible = not layer.visible
-
-            # Registreer actie voor undo
-            self._add_action(
-                "toggle_visibility",
-                {
-                    "layer_index": index,
-                    "old_visible": old_visible,
-                    "new_visible": layer.visible,
-                },
-            )
-
-            return layer.visible
-
-        return False
-
-    def toggle_layer_lock(self, index):
-        """
-        Schakelt de vergrendeling van een laag.
-
-        Args:
-            index (int): Index van de laag
-
-        Returns:
-            bool: Nieuwe vergrendelingsstatus
-        """
-        if 0 <= index < len(self.layers):
-            layer = self.layers[index]
-            old_locked = layer.locked
-            layer.locked = not layer.locked
-
-            # Registreer actie voor undo
-            self._add_action(
-                "toggle_lock",
-                {
-                    "layer_index": index,
-                    "old_locked": old_locked,
-                    "new_locked": layer.locked,
-                },
-            )
-
-            return layer.locked
-
-        return False
-
-    def new_map(self, width=None, height=None):
-        """
-        Maakt een nieuwe, lege kaart.
-
-        Args:
-            width (int, optional): Breedte, standaard uit config
-            height (int, optional): Hoogte, standaard uit config
-
-        Returns:
-            bool: True als succecvol
-        """
-        if width is None:
-            width = self.config.get("default_map_width", 40)
-        if height is None:
-            height = self.config.get("default_map_height", 30)
-
-        # Registreer actie voor undo
-        old_model_state = self.to_dict()
-        self._add_action("new_map", {"old_state": old_model_state})
-
-        # Reset attributen
-        self.width = width
-        self.height = height
-        self.current_file = None
-
-        # Maak nieuwe lagen
-        self.layers = []
-        default_layers = self.config.get("default_layers", [])
-
-        if default_layers:
-            for layer_config in default_layers:
-                self.layers.append(
-                    Layer(
-                        name=layer_config["name"],
-                        width=self.width,
-                        height=self.height,
-                        default_value=(
-                            self.config.get("default_tile", "G")
-                            if layer_config["name"] == "Terrein"
-                            else " "
-                        ),
-                        visible=layer_config.get("visible", True),
-                        locked=layer_config.get("locked", False),
-                    )
-                )
-        else:
-            self.layers.append(
-                Layer(
-                    name="Terrein",
-                    width=self.width,
-                    height=self.height,
-                    default_value=self.config.get("default_tile", "G"),
-                )
-            )
-
-        self.active_layer_index = 0
-
-        # Reset undo/redo stacks
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-
-        self.unsaved_changes = False
-
+        self._add_action("resize", {
+            "old_metadata": old_metadata,
+            "new_metadata": copy.deepcopy(self.metadata),
+            "old_layers_data": old_layers_struct, # Oude data en index
+            "new_layers_data": resized_layers_data  # Nieuwe data
+        })
         return True
 
+    def fill(self, value, layer_index=None, start_row=None, start_col=None, end_row=None, end_col=None):
+         """Vult een gebied van een TileLayer."""
+         layer_idx = layer_index if layer_index is not None else self.active_layer_index
+         if 0 <= layer_idx < len(self.layers):
+             layer = self.layers[layer_idx]
+             if isinstance(layer, TileLayer) and not layer.locked:
+                 try:
+                     int_value = int(value)
+                     changed_cells = layer.fill(int_value, start_row, start_col, end_row, end_col)
+                     if changed_cells:
+                         self._add_action("fill", {
+                             "layer_index": layer_idx,
+                             "changed_cells": changed_cells, # list of (row, col, old_value)
+                             "filled_value": int_value
+                         })
+                         return True
+                 except (ValueError, TypeError):
+                      print(f"Waarschuwing: Ongeldige waarde '{value}' voor fill.")
+         return False
+
+    def toggle_layer_visibility(self, index):
+        """Schakelt de zichtbaarheid van een laag."""
+        if 0 <= index < len(self.layers):
+            layer = self.layers[index]
+            old_visible = layer.set_visibility(not layer.visible) # Gebruik setter
+            self._add_action("toggle_visibility", {"layer_index": index, "old_value": old_visible})
+            # self.unsaved_changes = True # Wordt gedaan door _add_action
+            return layer.visible
+        return False # Geef huidige status terug bij falen?
+
+    def toggle_layer_lock(self, index):
+        """Schakelt de vergrendeling van een laag."""
+        if 0 <= index < len(self.layers):
+            layer = self.layers[index]
+            old_locked = layer.set_lock(not layer.locked) # Gebruik setter
+            self._add_action("toggle_lock", {"layer_index": index, "old_value": old_locked})
+            # self.unsaved_changes = True # Wordt gedaan door _add_action
+            return layer.locked
+        return False # Geef huidige status terug bij falen?
+
+    # --- Object Manipulatie ---
+    def add_object_to_active_layer(self, obj_type, x, y, width=32, height=32, name="", properties=None, gid=None):
+        """Voegt een object toe aan de actieve laag, indien het een ObjectGroupLayer is."""
+        layer = self.active_layer
+        if isinstance(layer, ObjectGroupLayer) and not layer.locked:
+            new_obj = MapObject(obj_type, x, y, width, height, name, properties, gid)
+            # Update nextobjectid in metadata (Tiled doet dit ook)
+            self.metadata["nextobjectid"] = max(self.metadata.get("nextobjectid", 1), new_obj.id + 1)
+            if layer.add_object(new_obj):
+                self._add_action("add_object", {
+                    "layer_index": self.active_layer_index,
+                    "object_data": new_obj.to_dict() # Sla data op voor undo
+                })
+                return new_obj
+        return None
+
+    def remove_object_from_active_layer(self, obj_id):
+        """Verwijdert een object van de actieve laag op basis van ID."""
+        layer = self.active_layer
+        if isinstance(layer, ObjectGroupLayer) and not layer.locked:
+            removed_obj = layer.remove_object(obj_id)
+            if removed_obj:
+                self._add_action("remove_object", {
+                    "layer_index": self.active_layer_index,
+                    "object_data": removed_obj.to_dict() # Sla data van verwijderd object op
+                })
+                return True
+        return False
+
+    def update_object_properties(self, obj_id, new_properties, layer_index=None):
+         """Werkt de properties bij van een object op de opgegeven of actieve laag."""
+         target_layer_index = layer_index if layer_index is not None else self.active_layer_index
+         if not (0 <= target_layer_index < len(self.layers)): return False
+
+         layer = self.layers[target_layer_index]
+         if isinstance(layer, ObjectGroupLayer) and not layer.locked:
+             obj_to_update = layer.get_object_by_id(obj_id)
+             if obj_to_update:
+                 old_properties = copy.deepcopy(obj_to_update.properties)
+                 # Update, overschrijf bestaande, voeg nieuwe toe
+                 obj_to_update.properties.update(new_properties)
+                 # Controleer of er daadwerkelijk iets veranderd is
+                 if old_properties != obj_to_update.properties:
+                     self._add_action("update_object_properties", {
+                         "layer_index": target_layer_index, "object_id": obj_id,
+                         "old_properties": old_properties,
+                         "new_properties": copy.deepcopy(obj_to_update.properties)
+                     })
+                     return True
+                 else:
+                      return True # Geen wijziging, maar actie 'geslaagd'
+         return False
+
+    def update_object_basic_info(self, obj_id, name=None, type=None, x=None, y=None, width=None, height=None, gid=None, layer_index=None):
+        """Werkt basis attributen bij van een object (naam, type, pos, size, gid)."""
+        target_layer_index = layer_index if layer_index is not None else self.active_layer_index
+        if not (0 <= target_layer_index < len(self.layers)): return False
+
+        layer = self.layers[target_layer_index]
+        if isinstance(layer, ObjectGroupLayer) and not layer.locked:
+            obj_to_update = layer.get_object_by_id(obj_id)
+            if obj_to_update:
+                old_basic_info = {
+                    "name": obj_to_update.name, "type": obj_to_update.type,
+                    "x": obj_to_update.x, "y": obj_to_update.y,
+                    "width": obj_to_update.width, "height": obj_to_update.height,
+                    "gid": obj_to_update.gid
+                }
+                changed = False
+                if name is not None and obj_to_update.name != name: obj_to_update.name = name; changed = True
+                if type is not None and obj_to_update.type != type: obj_to_update.type = type; changed = True
+                if x is not None and obj_to_update.x != x: obj_to_update.x = x; changed = True
+                if y is not None and obj_to_update.y != y: obj_to_update.y = y; changed = True
+                if width is not None and obj_to_update.width != width: obj_to_update.width = width; changed = True
+                if height is not None and obj_to_update.height != height: obj_to_update.height = height; changed = True
+                if gid is not None and obj_to_update.gid != gid: obj_to_update.gid = gid; changed = True # GID kan None zijn
+
+                if changed:
+                    new_basic_info = {
+                         "name": obj_to_update.name, "type": obj_to_update.type,
+                         "x": obj_to_update.x, "y": obj_to_update.y,
+                         "width": obj_to_update.width, "height": obj_to_update.height,
+                         "gid": obj_to_update.gid
+                    }
+                    self._add_action("update_object_basic", {
+                        "layer_index": target_layer_index, "object_id": obj_id,
+                        "old_info": old_basic_info, "new_info": new_basic_info
+                    })
+                    return True
+                else:
+                    return True # Geen wijziging, maar 'geslaagd'
+        return False
+
+    # --- Laden en Opslaan ---
     def load_map(self, filepath):
-        """
-        Laadt een kaart uit een bestand (alleen JSON-formaat).
-
-        Args:
-            filepath (str): Pad naar het bestand
-
-        Returns:
-            bool: True als succesvol
-        """
-        if not os.path.exists(filepath):
+        """Laadt een kaart uit een JSON-bestand."""
+        if not filepath or not os.path.exists(filepath) or not filepath.lower().endswith(".json"):
+            print(f"Fout: Ongeldig pad of geen JSON-bestand: {filepath}")
             return False
-
         try:
-            # Bewaar oude status voor undo
-            old_model_state = self.to_dict()
+            # Reset het model voordat we laden (belangrijk voor state)
+            # self.new_map() # Misschien beter om direct te overschrijven?
 
-            # Controleer of het een JSON-bestand is
-            if not filepath.lower().endswith(".json"):
-                print(
-                    f"Fout: Alleen JSON-bestanden worden ondersteund. Bestand moet eindigen op .json"
-                )
-                return False
+            # Sla huidige staat op VOORDAT we laden, voor undo
+            old_state_dict = self.to_dict()
 
-            # JSON formaat laden
-            return self._load_from_json(filepath)
-
-        except Exception as e:
-            print(f"Fout bij laden kaart: {e}")
-            return False
-
-    # De methoden _load_delimited en _load_ascii zijn verwijderd omdat we nu alleen JSON ondersteunen
-
-    def _load_from_json(self, filepath):
-        """Laadt een kaart in JSON formaat."""
-        try:
-            # Bewaar oude status voor undo
-            old_model_state = self.to_dict()
-
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            # Basis kaartinfo laden
-            self.width = data.get("width", 40)
-            self.height = data.get("height", 30)
-
-            # Lagen laden
-            self.layers = []
-            for layer_data in data.get("layers", []):
-                self.layers.append(Layer.from_dict(layer_data))
-
-            # Als er geen lagen zijn, maak een standaard laag
-            if not self.layers:
-                self.layers.append(
-                    Layer(
-                        name="Terrein",
-                        width=self.width,
-                        height=self.height,
-                        default_value=self.config.get("default_tile", "G"),
-                    )
-                )
-
-            self.active_layer_index = data.get("active_layer_index", 0)
-            if self.active_layer_index >= len(self.layers):
-                self.active_layer_index = 0
-
-            # Registreer actie voor undo
-            self._add_action(
-                "load_map", {"old_state": old_model_state, "new_state": self.to_dict()}
-            )
-
-            self.current_file = filepath
-            self.unsaved_changes = False
-
-            # Voeg toe aan recente bestanden
-            self.config.add_recent_file(filepath)
-
-            return True
-
-        except Exception as e:
-            print(f"Fout bij laden JSON kaart: {e}")
-            return False
-
-    def save_map(self, filepath=None):
-        """
-        Slaat de kaart op naar een bestand (alleen JSON-formaat).
-
-        Args:
-            filepath (str, optional): Pad om naar op te slaan, standaard current_file
-
-        Returns:
-            bool: True als succesvol
-        """
-        if filepath is None:
-            filepath = self.current_file
-
-        if not filepath:
-            return False
-
-        try:
-            # Maak de directory aan als deze niet bestaat
-            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-
-            # Zorg dat het bestand eindigt op .json
-            if not filepath.lower().endswith(".json"):
-                filepath += ".json"
-
-            # Sla op als JSON
-            success = self._save_to_json(filepath)
+            # Laad de nieuwe structuur
+            success = self._load_from_json(filepath)
 
             if success:
-                self.current_file = filepath
-                self.unsaved_changes = False
-
-                # Voeg toe aan recente bestanden
-                self.config.add_recent_file(filepath)
-
+                 # Reset undo/redo na succesvol laden
+                 self.undo_stack.clear()
+                 self.redo_stack.clear()
+                 # Voeg de laad-actie toe aan undo (met oude staat)
+                 self._add_action("load_map", {"old_state": old_state_dict, "new_state": self.to_dict()})
+                 self.unsaved_changes = False # Net geladen = geen wijzigingen
             return success
-
         except Exception as e:
-            print(f"Fout bij opslaan kaart: {e}")
+            print(f"Algemene fout bij laden kaart '{filepath}': {e}")
+            # Herstel mogelijk de oude staat? Lastig.
             return False
 
-    # De methoden _save_delimited en _save_as_ascii zijn verwijderd omdat we nu alleen JSON ondersteunen
+    def _load_from_json(self, filepath):
+        """Laadt kaart data uit JSON bestand en update het model."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Fout: Ongeldig JSON-formaat in '{filepath}': {e}")
+            return False
+        except IOError as e:
+             print(f"Fout: Kan bestand niet lezen '{filepath}': {e}")
+             return False
+
+        # --- Laad Metadata (Tiled-stijl) ---
+        # Start met defaults, overschrijf met geladen data
+        map_w = data.get("width", self.config.get("default_map_width", 40))
+        map_h = data.get("height", self.config.get("default_map_height", 30))
+        tile_w = data.get("tilewidth", self.config.get("tile_width", 32))
+        tile_h = data.get("tileheight", self.config.get("tile_height", 32))
+
+        self.metadata = {
+            "mapName": os.path.splitext(os.path.basename(filepath))[0], # Gebruik bestandsnaam als default
+            "mapWidth": map_w, "mapHeight": map_h,
+            "tileWidth": tile_w, "tileHeight": tile_h,
+            "bgMusic": data.get("properties", [{}])[0].get("bgMusic", ""), # Tiled stopt custom props vaak hier
+            "infinite": data.get("infinite", False),
+            "nextlayerid": data.get("nextlayerid", 1),
+            "nextobjectid": data.get("nextobjectid", 1),
+            "orientation": data.get("orientation", "orthogonal"),
+            "renderorder": data.get("renderorder", "right-down"),
+            "tiledversion": data.get("tiledversion", "1.10.0"),
+            "tilesets": data.get("tilesets", []), # Laad tilesets mee, ook al gebruiken we ze niet direct
+            "type": data.get("type", "map"),
+            "version": data.get("version", "1.10")
+        }
+        # Laad eventuele top-level custom properties (minder gangbaar in Tiled)
+        if "properties" in data:
+             self.metadata["custom_properties"] = data["properties"]
+
+
+        self.width = map_w
+        self.height = map_h
+
+        # Reset object ID counter voor deze map load
+        MapObject._next_id = 1
+
+        # --- Laad Lagen ---
+        self.layers = []
+        next_layer_id_calc = 1
+        max_obj_id_calc = 0
+        loaded_layers_data = data.get("layers", [])
+        for layer_data in loaded_layers_data:
+            layer_type = layer_data.get("type")
+            layer = None
+            try:
+                if layer_type == "tilelayer":
+                    layer = TileLayer.from_dict(layer_data)
+                    # Check & Corrigeer dimensies indien nodig
+                    if layer.width != self.width or layer.height != self.height:
+                        print(f"Waarschuwing: Dimensies van tile layer '{layer.name}' (ID {layer.id}) gecorrigeerd naar kaartformaat.")
+                        layer.resize(self.width, self.height, layer.default_value)
+                elif layer_type == "objectgroup":
+                    layer = ObjectGroupLayer.from_dict(layer_data, self.width, self.height)
+                    # Update max object ID
+                    for obj in layer.objects:
+                        max_obj_id_calc = max(max_obj_id_calc, obj.id)
+                else:
+                    print(f"Onbekend laagtype '{layer_type}' overgeslagen bij laden.")
+
+                if layer:
+                    # Neem ID over uit data, of gebruik counter
+                    layer.id = layer_data.get("id", next_layer_id_calc)
+                    self.layers.append(layer)
+                    next_layer_id_calc = max(next_layer_id_calc, layer.id + 1)
+            except Exception as e:
+                 print(f"Fout bij laden laag '{layer_data.get('name', 'Onbekend')}': {e}")
+
+        # Update metadata met berekende next IDs
+        self.metadata["nextlayerid"] = max(next_layer_id_calc, self.metadata.get("nextlayerid", next_layer_id_calc))
+        # Zorg dat MapObject counter en metadata syncen
+        MapObject._next_id = max(max_obj_id_calc + 1, MapObject._next_id)
+        self.metadata["nextobjectid"] = max(MapObject._next_id, self.metadata.get("nextobjectid", MapObject._next_id))
+
+
+        # Fallback als geen lagen geladen zijn
+        if not self.layers:
+             print("Waarschuwing: Geen lagen gevonden in JSON, standaard 'Terrain' laag aangemaakt.")
+             default_layer = TileLayer(name="Terrain", width=self.width, height=self.height, id=1)
+             self.layers.append(default_layer)
+             self.metadata["nextlayerid"] = 2
+
+        self.active_layer_index = 0 # Start altijd op de eerste laag na laden
+        self.current_file = filepath
+        # self.unsaved_changes = False # Wordt gezet door aanroepende load_map
+        # self.config.add_recent_file(filepath) # Wordt gezet door aanroepende save/load_map
+        return True # Succesvol geparsed (binnen de try-except van load_map)
+
+    def save_map(self, filepath=None):
+        """Slaat de kaart op naar een JSON-bestand."""
+        save_path = filepath if filepath else self.current_file
+        if not save_path:
+            print("Fout: Geen bestandspad opgegeven om op te slaan.")
+            return False
+
+        # Zorg dat het pad eindigt op .json
+        if not save_path.lower().endswith(".json"):
+            save_path += ".json"
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            success = self._save_to_json(save_path)
+            if success:
+                self.current_file = save_path
+                self.unsaved_changes = False
+                # self.config.add_recent_file(save_path) # Config moet buiten model beheerd worden
+            return success
+        except Exception as e:
+            print(f"Fout bij opslaan kaart naar '{save_path}': {e}")
+            return False
 
     def _save_to_json(self, filepath):
-        """Slaat de kaart op in JSON formaat (ondersteunt alle features)."""
+        """Slaat de kaart op in Tiled-compatibel JSON formaat."""
         try:
-            # Volledige model data als dictionary
-            data = self.to_dict()
+            map_data = self.to_dict() # Haal de volledige datastructuur op
 
             with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(map_data, f, indent=2) # indent=2 voor leesbaarheid
 
             return True
-
         except Exception as e:
-            print(f"Fout bij opslaan JSON kaart: {e}")
+            print(f"Fout tijdens schrijven JSON naar '{filepath}': {e}")
             return False
 
-    def export_to_string(self):
-        """
-        Exporteert de kaart als JSON string.
-
-        Returns:
-            str: De kaart als JSON string
-        """
-        # Export als JSON string
-        data = self.to_dict()
-        return json.dumps(data, indent=2)
-
     def to_dict(self):
-        """Converteert het model naar een dictionary voor JSON-serialisatie."""
-        return {
+        """Converteert het volledige model naar een Tiled-compatibele dictionary."""
+        # Update next IDs in metadata voordat we opslaan
+        self.metadata["nextlayerid"] = max(layer.id for layer in self.layers if hasattr(layer, 'id')) + 1 if self.layers else 1
+        self.metadata["nextobjectid"] = MapObject._next_id
+
+        map_data = {
+            # Metadata velden die direct overeenkomen met Tiled formaat
             "width": self.width,
             "height": self.height,
-            "active_layer_index": self.active_layer_index,
-            "layers": [layer.to_dict() for layer in self.layers],
-            "version": "1.0",
+            "tilewidth": self.metadata.get("tileWidth", 32),
+            "tileheight": self.metadata.get("tileHeight", 32),
+            "infinite": self.metadata.get("infinite", False),
+            "nextlayerid": self.metadata["nextlayerid"],
+            "nextobjectid": self.metadata["nextobjectid"],
+            "orientation": self.metadata.get("orientation", "orthogonal"),
+            "renderorder": self.metadata.get("renderorder", "right-down"),
+            "tiledversion": self.metadata.get("tiledversion", "1.10.0"),
+            "tilesets": self.metadata.get("tilesets", []), # Behoud tilesets indien geladen
+            "type": "map",
+            "version": self.metadata.get("version", "1.10"),
+            # Lagen data
+            "layers": [layer.to_dict() for layer in self.layers if layer is not None],
+            # Custom properties (optioneel, Tiled stopt ze vaak hier)
+            "properties": [
+                 {"name": "bgMusic", "type": "string", "value": self.metadata.get("bgMusic", "")}
+                 # Voeg hier eventuele andere custom map properties toe
+            ]
+            # mapName zit niet standaard in Tiled JSON, maar in onze metadata
         }
+        # Voeg onze custom metadata toe die niet standaard Tiled is (optioneel)
+        # map_data["custom_metadata"] = {k: v for k, v in self.metadata.items() if k not in map_data}
+        return map_data
 
+    # --- Undo/Redo ---
     def _add_action(self, action_type, data):
-        """
-        Voegt een actie toe aan de undo-stack.
-
-        Args:
-            action_type (str): Type actie
-            data (dict): Data voor de actie
-        """
-        self.undo_stack.append(MapAction(action_type, data))
-        self.redo_stack.clear()  # Wis redo-stack na nieuwe actie
+        """Voegt een actie toe aan de undo-stack. Gebruikt deep copies."""
+        try:
+            # Maak diepe kopieën om te voorkomen dat latere wijzigingen de undo-data beïnvloeden
+            action_data_copy = copy.deepcopy(data)
+            self.undo_stack.append(MapAction(action_type, action_data_copy))
+            self.redo_stack.clear() # Nieuwe actie maakt redo-historie ongeldig
+            self.unsaved_changes = True # Elke actie wordt als wijziging gezien
+        except Exception as e:
+            print(f"Fout bij maken deepcopy voor undo actie '{action_type}': {e}")
+            # Wat te doen? Undo niet toevoegen? Geeft risico op inconsistente staat.
+            # Misschien beter om hier te crashen of een duidelijke error te geven.
 
     def has_unsaved_changes(self):
         """Controleert of er onopgeslagen wijzigingen zijn."""
@@ -893,241 +622,320 @@ class MapModel:
         return len(self.redo_stack) > 0
 
     def undo(self):
-        """
-        Maakt de laatste actie ongedaan.
-
-        Returns:
-            tuple: (success, action_type)
-        """
-        if not self.undo_stack:
-            return (False, None)
-
+        """Maakt de laatste actie ongedaan."""
+        if not self.can_undo(): return False
         action = self.undo_stack.pop()
+        success = False
 
-        # Voer de juiste undo-operatie uit op basis van actie-type
-        if action.type == "set_cell":
-            row = action.data["row"]
-            col = action.data["col"]
-            old_value = action.data["old_value"]
-            layer_index = action.data["layer_index"]
+        try:
+            if action.type == "set_cell":
+                layer = self.layers[action.data["layer_index"]]
+                if isinstance(layer, TileLayer):
+                    layer.set_cell(action.data["row"], action.data["col"], action.data["old_value"])
+                    success = True
+            elif action.type == "fill":
+                layer = self.layers[action.data["layer_index"]]
+                if isinstance(layer, TileLayer):
+                    for row, col, old_value in action.data["changed_cells"]:
+                        layer.set_cell(row, col, old_value)
+                    success = True
+            elif action.type == "resize":
+                 self._restore_from_dict(action.data["old_state"]) # Herstel volledige oude staat
+                 success = True
+            elif action.type == "add_layer":
+                 layer_idx = action.data["layer_index"]
+                 if 0 <= layer_idx < len(self.layers):
+                     # Verifieer of de laag op die index overeenkomt (simpele check)
+                     if self.layers[layer_idx].id == action.data["layer_data"]["id"]:
+                         self.layers.pop(layer_idx)
+                         # Pas actieve index aan
+                         if self.active_layer_index >= len(self.layers): self.active_layer_index = max(0, len(self.layers) - 1)
+                         elif self.active_layer_index > layer_idx: self.active_layer_index -= 1
+                         success = True
+            elif action.type == "remove_layer":
+                 layer_idx = action.data["layer_index"]
+                 layer_data = action.data["layer_data"]
+                 layer_type = layer_data.get("type")
+                 layer = None
+                 # Maak laag opnieuw aan van opgeslagen data
+                 if layer_type == "tilelayer": layer = TileLayer.from_dict(layer_data)
+                 elif layer_type == "objectgroup": layer = ObjectGroupLayer.from_dict(layer_data, self.width, self.height)
+                 if layer and 0 <= layer_idx <= len(self.layers):
+                     self.layers.insert(layer_idx, layer)
+                     # Pas actieve index aan
+                     if layer_idx <= self.active_layer_index: self.active_layer_index += 1
+                     success = True
+            elif action.type == "move_layer":
+                 old_idx = action.data["old_index"]
+                 new_idx = action.data["new_index"]
+                 # Verplaats terug
+                 layer = self.layers.pop(new_idx)
+                 self.layers.insert(old_idx, layer)
+                 # Herstel actieve index
+                 if self.active_layer_index == new_idx: self.active_layer_index = old_idx
+                 elif min(old_idx, new_idx) <= self.active_layer_index <= max(old_idx, new_idx):
+                     self.active_layer_index += 1 if new_idx < old_idx else -1
+                 success = True
+            elif action.type == "toggle_visibility":
+                 layer = self.layers[action.data["layer_index"]]
+                 layer.set_visibility(action.data["old_value"])
+                 success = True
+            elif action.type == "toggle_lock":
+                 layer = self.layers[action.data["layer_index"]]
+                 layer.set_lock(action.data["old_value"])
+                 success = True
+            elif action.type == "add_object":
+                 layer = self.layers[action.data["layer_index"]]
+                 if isinstance(layer, ObjectGroupLayer):
+                     obj_data = action.data["object_data"]
+                     # Verwijder object met dezelfde ID
+                     layer.objects = [obj for obj in layer.objects if obj.id != obj_data.get("id")]
+                     success = True
+            elif action.type == "remove_object":
+                 layer = self.layers[action.data["layer_index"]]
+                 if isinstance(layer, ObjectGroupLayer):
+                     obj_data = action.data["object_data"]
+                     # Voeg object terug toe
+                     layer.add_object(MapObject.from_dict(obj_data))
+                     success = True
+            elif action.type == "update_object_properties":
+                 layer = self.layers[action.data["layer_index"]]
+                 if isinstance(layer, ObjectGroupLayer):
+                     obj = layer.get_object_by_id(action.data["object_id"])
+                     if obj:
+                         obj.properties = copy.deepcopy(action.data["old_properties"])
+                         success = True
+            elif action.type == "update_object_basic":
+                 layer = self.layers[action.data["layer_index"]]
+                 if isinstance(layer, ObjectGroupLayer):
+                     obj = layer.get_object_by_id(action.data["object_id"])
+                     if obj:
+                         old_info = action.data["old_info"]
+                         obj.name = old_info["name"]
+                         obj.type = old_info["type"]
+                         obj.x = old_info["x"]
+                         obj.y = old_info["y"]
+                         obj.width = old_info["width"]
+                         obj.height = old_info["height"]
+                         obj.gid = old_info["gid"]
+                         success = True
+            elif action.type == "new_map" or action.type == "load_map":
+                 self._restore_from_dict(action.data["old_state"])
+                 success = True
+            else:
+                 print(f"Undo niet geïmplementeerd voor actie: {action.type}")
 
-            if 0 <= layer_index < len(self.layers):
-                layer = self.layers[layer_index]
-                layer.set_cell(row, col, old_value)
+            if success:
+                self.redo_stack.append(action)
+                # De staat is nu *mogelijk* weer zoals voor de laatste actie.
+                # unsaved_changes moet idealiter bijgehouden worden of de staat
+                # gelijk is aan de laatst opgeslagen staat. Voor nu:
+                # self.unsaved_changes = self.can_undo()
+                return True # Geef aan dat undo geslaagd is
+        except Exception as e:
+            print(f"Fout tijdens undo van {action.type}: {e}")
+            # Probeer de actie terug te zetten op de undo stack? Riskant.
+        return False
 
-        elif action.type == "fill":
-            layer_index = action.data["layer_index"]
-            changed_cells = action.data["changed_cells"]
-
-            if 0 <= layer_index < len(self.layers):
-                layer = self.layers[layer_index]
-                for row, col, old_value in changed_cells:
-                    layer.set_cell(row, col, old_value)
-
-        elif action.type == "resize":
-            old_width = action.data["old_width"]
-            old_height = action.data["old_height"]
-            old_layers_data = action.data["old_layers_data"]
-
-            self.width = old_width
-            self.height = old_height
-
-            # Herstel lagen uit backup
-            for layer_data in old_layers_data:
-                index = layer_data["index"]
-                data = layer_data["data"]
-
-                if 0 <= index < len(self.layers):
-                    self.layers[index] = Layer.from_dict(data)
-
-        elif action.type == "add_layer":
-            layer_index = action.data["layer_index"]
-
-            if 0 <= layer_index < len(self.layers):
-                self.layers.pop(layer_index)
-
-                # Update active_layer_index indien nodig
-                if self.active_layer_index >= len(self.layers):
-                    self.active_layer_index = len(self.layers) - 1
-
-        elif action.type == "remove_layer":
-            layer_index = action.data["layer_index"]
-            layer_data = action.data["layer_data"]
-
-            # Voeg de laag weer toe op de juiste index
-            if 0 <= layer_index <= len(self.layers):
-                self.layers.insert(layer_index, Layer.from_dict(layer_data))
-
-                # Herstel active_layer_index indien nodig
-                if layer_index <= self.active_layer_index:
-                    self.active_layer_index = min(
-                        len(self.layers) - 1, self.active_layer_index + 1
-                    )
-
-        elif action.type == "toggle_visibility":
-            layer_index = action.data["layer_index"]
-            old_visible = action.data["old_visible"]
-
-            if 0 <= layer_index < len(self.layers):
-                self.layers[layer_index].visible = old_visible
-
-        elif action.type == "toggle_lock":
-            layer_index = action.data["layer_index"]
-            old_locked = action.data["old_locked"]
-
-            if 0 <= layer_index < len(self.layers):
-                self.layers[layer_index].locked = old_locked
-
-        elif action.type == "new_map" or action.type == "load_map":
-            # Volledig herstel van oude status
-            old_state = action.data["old_state"]
-
-            self.width = old_state["width"]
-            self.height = old_state["height"]
-            self.active_layer_index = old_state["active_layer_index"]
-
-            # Herstel lagen
-            self.layers = []
-            for layer_data in old_state["layers"]:
-                self.layers.append(Layer.from_dict(layer_data))
-
-        elif action.type == "move_layer":
-            old_index = action.data["old_index"]
-            new_index = action.data["new_index"]
-            
-            # Verplaats terug naar oude positie (undo)
-            layer = self.layers.pop(new_index)
-            self.layers.insert(old_index, layer)
-            
-            # Reset actieve laag index
-            self.active_layer_index = old_index
-
-        # Bewaar actie in redo-stack
-        self.redo_stack.append(action)
-
-        self.unsaved_changes = True
-
-        return (True, action.type)
 
     def redo(self):
-        """
-        Doet de laatst ongedaan gemaakte actie opnieuw.
-
-        Returns:
-            tuple: (success, action_type)
-        """
-        if not self.redo_stack:
-            return (False, None)
-
+        """Doet de laatst ongedaan gemaakte actie opnieuw."""
+        if not self.can_redo(): return False
         action = self.redo_stack.pop()
+        success = False
 
-        # Voer de juiste redo-operatie uit op basis van actie-type
-        if action.type == "set_cell":
-            row = action.data["row"]
-            col = action.data["col"]
-            new_value = action.data["new_value"]
-            layer_index = action.data["layer_index"]
+        try:
+            if action.type == "set_cell":
+                layer = self.layers[action.data["layer_index"]]
+                if isinstance(layer, TileLayer):
+                    layer.set_cell(action.data["row"], action.data["col"], action.data["new_value"])
+                    success = True
+            elif action.type == "fill":
+                layer = self.layers[action.data["layer_index"]]
+                if isinstance(layer, TileLayer):
+                    # We hebben de filled_value opgeslagen
+                    for row, col, _ in action.data["changed_cells"]:
+                         layer.set_cell(row, col, action.data["filled_value"])
+                    success = True
+            elif action.type == "resize":
+                 self._restore_from_dict(action.data["new_state"]) # Herstel naar nieuwe staat
+                 success = True
+            elif action.type == "add_layer":
+                 # Voeg laag opnieuw toe
+                 layer_idx = action.data["layer_index"]
+                 layer_data = action.data["layer_data"]
+                 layer_type = layer_data.get("type")
+                 layer = None
+                 if layer_type == "tilelayer": layer = TileLayer.from_dict(layer_data)
+                 elif layer_type == "objectgroup": layer = ObjectGroupLayer.from_dict(layer_data, self.width, self.height)
+                 if layer and 0 <= layer_idx <= len(self.layers):
+                     self.layers.insert(layer_idx, layer)
+                     # Pas actieve index aan
+                     if layer_idx <= self.active_layer_index: self.active_layer_index += 1
+                     success = True
+            elif action.type == "remove_layer":
+                 # Verwijder laag opnieuw
+                 layer_idx = action.data["layer_index"]
+                 if 0 <= layer_idx < len(self.layers):
+                     # Verifieer of het de juiste laag is
+                     if self.layers[layer_idx].id == action.data["layer_data"]["id"]:
+                         self.layers.pop(layer_idx)
+                         # Pas actieve index aan
+                         if self.active_layer_index >= len(self.layers): self.active_layer_index = max(0, len(self.layers) - 1)
+                         elif self.active_layer_index > layer_idx: self.active_layer_index -= 1
+                         success = True
+            elif action.type == "move_layer":
+                 old_idx = action.data["old_index"]
+                 new_idx = action.data["new_index"]
+                 # Verplaats opnieuw
+                 layer = self.layers.pop(old_idx)
+                 self.layers.insert(new_idx, layer)
+                 # Update actieve index
+                 if self.active_layer_index == old_idx: self.active_layer_index = new_idx
+                 elif min(old_idx, new_idx) <= self.active_layer_index <= max(old_idx, new_idx):
+                     self.active_layer_index += 1 if old_idx < new_idx else -1
+                 success = True
+            elif action.type == "toggle_visibility":
+                 layer = self.layers[action.data["layer_index"]]
+                 # Toggle naar !old_value
+                 layer.set_visibility(not action.data["old_value"])
+                 success = True
+            elif action.type == "toggle_lock":
+                 layer = self.layers[action.data["layer_index"]]
+                 layer.set_lock(not action.data["old_value"])
+                 success = True
+            elif action.type == "add_object":
+                 layer = self.layers[action.data["layer_index"]]
+                 if isinstance(layer, ObjectGroupLayer):
+                     obj_data = action.data["object_data"]
+                     # Voeg object terug toe
+                     layer.add_object(MapObject.from_dict(obj_data))
+                     success = True
+            elif action.type == "remove_object":
+                 layer = self.layers[action.data["layer_index"]]
+                 if isinstance(layer, ObjectGroupLayer):
+                     obj_data = action.data["object_data"]
+                     # Verwijder object opnieuw
+                     layer.objects = [obj for obj in layer.objects if obj.id != obj_data.get("id")]
+                     success = True
+            elif action.type == "update_object_properties":
+                 layer = self.layers[action.data["layer_index"]]
+                 if isinstance(layer, ObjectGroupLayer):
+                     obj = layer.get_object_by_id(action.data["object_id"])
+                     if obj:
+                         obj.properties = copy.deepcopy(action.data["new_properties"])
+                         success = True
+            elif action.type == "update_object_basic":
+                  layer = self.layers[action.data["layer_index"]]
+                  if isinstance(layer, ObjectGroupLayer):
+                      obj = layer.get_object_by_id(action.data["object_id"])
+                      if obj:
+                          new_info = action.data["new_info"]
+                          obj.name = new_info["name"]
+                          obj.type = new_info["type"]
+                          obj.x = new_info["x"]
+                          obj.y = new_info["y"]
+                          obj.width = new_info["width"]
+                          obj.height = new_info["height"]
+                          obj.gid = new_info["gid"]
+                          success = True
+            elif action.type == "new_map" or action.type == "load_map":
+                 # Herstel de *gehele* nieuwe staat die bij de actie was opgeslagen
+                 new_state = action.data["new_state"]
+                 self._restore_from_dict(new_state)
+                 success = True
+            else:
+                 print(f"Redo niet geïmplementeerd voor actie: {action.type}")
 
-            if 0 <= layer_index < len(self.layers):
-                layer = self.layers[layer_index]
-                layer.set_cell(row, col, new_value)
+            if success:
+                self.undo_stack.append(action)
+                self.unsaved_changes = True
+                return True
+        except Exception as e:
+            print(f"Fout tijdens redo van {action.type}: {e}")
+            # Actie terugzetten op redo stack?
+            self.redo_stack.append(action) # Probeer terug te zetten
+        return False
 
-        elif action.type == "fill":
-            layer_index = action.data["layer_index"]
-            changed_cells = action.data["changed_cells"]
+    def _restore_from_dict(self, state_dict):
+        """Herstelt de volledige model staat van een dictionary (voor undo load/new)."""
+        # Zorg ervoor dat state_dict niet None is
+        if not state_dict:
+             print("Fout: Kan staat niet herstellen vanuit lege dictionary.")
+             # Mogelijk terugvallen op new_map() ?
+             self.new_map()
+             return
 
-            if 0 <= layer_index < len(self.layers):
-                layer = self.layers[layer_index]
-                # Als we de nieuwe waarde hebben, kunnen we die gebruiken, anders
-                # moeten we een extra set_cell actie doen om het opnieuw te vullen
-                for next_action in self.redo_stack:
-                    if (
-                        next_action.type == "set_cell"
-                        and next_action.data["layer_index"] == layer_index
-                    ):
-                        new_value = next_action.data["new_value"]
-                        for row, col, _ in changed_cells:
-                            layer.set_cell(row, col, new_value)
-                        break
+        try:
+            # --- Herstel Metadata ---
+            self.metadata = copy.deepcopy(state_dict.get("metadata", {}))
+            # Zet basis defaults als ze missen in de oude staat
+            self.width = self.metadata.setdefault("mapWidth", self.config.get("default_map_width", 40))
+            self.height = self.metadata.setdefault("mapHeight", self.config.get("default_map_height", 30))
+            self.metadata.setdefault("tileWidth", self.config.get("tile_width", 32))
+            self.metadata.setdefault("tileHeight", self.config.get("tile_height", 32))
+            # Herstel andere belangrijke metadata
+            self.metadata.setdefault("infinite", False)
+            self.metadata.setdefault("orientation", "orthogonal")
+            self.metadata.setdefault("renderorder", "right-down")
+            self.metadata.setdefault("version", "1.9") # Ouder formaat misschien?
+            self.metadata.setdefault("tiledversion", "1.9.0")
+            self.metadata.setdefault("type", "map")
+            self.metadata.setdefault("tilesets", [])
 
-        elif action.type == "resize":
-            new_width = action.data["new_width"]
-            new_height = action.data["new_height"]
 
-            # Pas grootte van alle lagen aan
-            for layer in self.layers:
-                layer.resize(new_width, new_height, " ")
-
-            self.width = new_width
-            self.height = new_height
-
-        elif action.type == "add_layer":
-            layer_index = action.data["layer_index"]
-
-            # Als we de laagdata niet hebben, voeg dan een nieuwe standaard laag toe
-            # De juiste data zou moeten worden ingesteld door latere set_cell acties
-            if 0 <= layer_index <= len(self.layers):
-                self.layers.insert(
-                    layer_index,
-                    Layer(
-                        name=f"Layer {layer_index}",
-                        width=self.width,
-                        height=self.height,
-                        default_value=" ",
-                    ),
-                )
-
-        elif action.type == "remove_layer":
-            layer_index = action.data["layer_index"]
-
-            if 0 <= layer_index < len(self.layers):
-                self.layers.pop(layer_index)
-
-                # Update active_layer_index indien nodig
-                if self.active_layer_index >= len(self.layers):
-                    self.active_layer_index = len(self.layers) - 1
-
-        elif action.type == "toggle_visibility":
-            layer_index = action.data["layer_index"]
-            new_visible = action.data["new_visible"]
-
-            if 0 <= layer_index < len(self.layers):
-                self.layers[layer_index].visible = new_visible
-
-        elif action.type == "toggle_lock":
-            layer_index = action.data["layer_index"]
-            new_locked = action.data["new_locked"]
-
-            if 0 <= layer_index < len(self.layers):
-                self.layers[layer_index].locked = new_locked
-
-        elif action.type == "new_map" or action.type == "load_map":
-            # Volledig herstel van nieuwe status
-            new_state = action.data["new_state"]
-
-            self.width = new_state["width"]
-            self.height = new_state["height"]
-            self.active_layer_index = new_state["active_layer_index"]
-
-            # Herstel lagen
+            # --- Herstel Lagen ---
             self.layers = []
-            for layer_data in new_state["layers"]:
-                self.layers.append(Layer.from_dict(layer_data))
+            next_layer_id_calc = 1
+            max_obj_id_calc = 0
+            loaded_layers_data = state_dict.get("layers", [])
+            for layer_data in loaded_layers_data:
+                layer_type = layer_data.get("type")
+                layer = None
+                if layer_type == "tilelayer":
+                    layer = TileLayer.from_dict(layer_data)
+                    # Corrigeer eventuele dimensie mismatches
+                    if layer.width != self.width or layer.height != self.height:
+                        layer.resize(self.width, self.height)
+                elif layer_type == "objectgroup":
+                    layer = ObjectGroupLayer.from_dict(layer_data, self.width, self.height)
+                    for obj in layer.objects:
+                        max_obj_id_calc = max(max_obj_id_calc, obj.id)
+                else: # Oude formaat had geen type, neem aan tilelayer
+                    print("Info: Laag zonder type gevonden, aanname: tilelayer.")
+                    # Probeer als TileLayer te laden (vereist aanpassing from_dict of aparte logica)
+                    # Voor nu, maken we een lege TileLayer
+                    layer = TileLayer(name=layer_data.get("name", f"Laag {next_layer_id_calc}"),
+                                      width=self.width, height=self.height,
+                                      id=layer_data.get("id", next_layer_id_calc))
+                    # Probeer data te laden als 2D array
+                    old_data = layer_data.get("data", [])
+                    if isinstance(old_data, list) and len(old_data) == self.height:
+                        layer.data = [[int(c) if str(c).isdigit() else 0 for c in r] for r in old_data]
 
-        elif action.type == "move_layer":
-            old_index = action.data["old_index"]
-            new_index = action.data["new_index"]
-    
-            # Verplaats opnieuw naar nieuwe positie (redo)
-            layer = self.layers.pop(old_index)
-            self.layers.insert(new_index, layer)
-    
-            # Update actieve laag index
-            self.active_layer_index = new_index
 
-        # Bewaar actie in undo-stack
-        self.undo_stack.append(action)
+                if layer:
+                    layer.id = layer_data.get("id", next_layer_id_calc)
+                    self.layers.append(layer)
+                    next_layer_id_calc = max(next_layer_id_calc, layer.id + 1)
 
-        self.unsaved_changes = True
+            # Herstel next IDs
+            self.metadata["nextlayerid"] = max(next_layer_id_calc, state_dict.get("nextlayerid", next_layer_id_calc))
+            MapObject._next_id = max(max_obj_id_calc + 1, 1)
+            self.metadata["nextobjectid"] = max(MapObject._next_id, state_dict.get("nextobjectid", MapObject._next_id))
 
-        return (True, action.type)
+
+            # Herstel actieve laag index uit oude formaat indien aanwezig
+            self.active_layer_index = state_dict.get("active_layer_index", 0)
+            if self.active_layer_index >= len(self.layers):
+                 self.active_layer_index = max(0, len(self.layers) - 1)
+
+            # current_file en unsaved_changes worden niet direct hersteld door undo
+            # De aanroepende undo methode moet dit mogelijk afhandelen
+
+        except Exception as e:
+            print(f"Fout tijdens herstellen van staat: {e}. Model kan inconsistent zijn.")
+            # Terugvallen op een nieuwe, lege kaart?
+            # self.new_map() # Riskant
+
+# --- Einde van map_model.py ---
